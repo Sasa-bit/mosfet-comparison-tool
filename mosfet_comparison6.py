@@ -70,7 +70,7 @@ Yellow cells = user-editable operating conditions.
 Blue cells   = device parameters (pre-filled, fully editable).
 """
 
-import sys, os, re, warnings, io, tempfile
+import sys, os, re, warnings, io, tempfile, math
 from pathlib import Path
 
 import numpy as np
@@ -164,6 +164,15 @@ PARAMS = {
 PRIORITY_KEYS  = [k for k, v in PARAMS.items() if v[3]]
 SECONDARY_KEYS = [k for k, v in PARAMS.items() if not v[3]]
 ALL_KEYS       = PRIORITY_KEYS + SECONDARY_KEYS
+
+# ─── LOG-GRAPH PARAMETERS ─────────────────────────────────────────────────────
+# Parameters whose datasheet values come from a LOG-scale graph (C-vs-VDS).
+# Auto-extraction and the 1/√V depletion formula are both unreliable for these,
+# so in the Common-Ground sheet we do not print a misleading number — instead we
+# point the reader to the side-by-side datasheet images in the Graph Comparison
+# sheet.  (User request: "just put this line — refer the graphs in graph section".)
+_REFER_TO_GRAPH_KEYS = {"ciss", "coss", "crss"}
+_REFER_TO_GRAPH_TEXT = "refer the graphs in graph section"
 
 # ─── v5 EXCEL READER ──────────────────────────────────────────────────────────
 
@@ -1067,6 +1076,279 @@ def extract_figures_from_file(path):
     return figs
 
 
+# ─── NORMALISED-RATIO CURVE CLEANING ──────────────────────────────────────────
+# Chart types whose Y-axis is a normalised ratio (0.5–3.0 range), NOT absolute
+# units. Their digitised series sometimes contain ×10 / ×100 / ÷100 errors from
+# pixel mis-reads or European decimal notation ("3.000" read as 3000).
+_NORM_RATIO_CTYPES = {'rds_vs_temp', 'vth_vs_temp', 'vbr_vs_temp'}
+
+
+def _pow10_closest(v, ref):
+    """Return v multiplied/divided by the power of 10 that lands it closest
+    (in log space) to the local reference level `ref`.  Used to undo ×10/×100/
+    ÷100 digitisation errors without touching values that are already correct."""
+    a = abs(float(v))
+    if a == 0:
+        return 0.0
+    ref = max(abs(ref), 1e-9)
+    best, best_d = a, float('inf')
+    for p in range(-5, 6):
+        c = a * (10.0 ** p)
+        d = abs(math.log10(c) - math.log10(ref))
+        if d < best_d:
+            best_d, best = d, c
+    return math.copysign(best, v)
+
+
+def _fig_is_ratio(f):
+    """True when a figure's Y-axis is a normalised ratio (median |y| < 20),
+    as opposed to absolute units (e.g. V_BR in volts ≈ 600)."""
+    ys = sorted(abs(float(y)) for s in f.get('series', [])
+                for y in s.get('y', []) if y is not None)
+    if not ys:
+        return False
+    return ys[len(ys) // 2] < 20.0
+
+
+def _clean_ratio_series(xs, ys, monotone_dir=0):
+    """
+    Clean one normalised-ratio series.  Two-pass strategy:
+
+    Pass 1 — Global pre-scale:
+      If the MEDIAN of all raw values is outside [0.1, 10], find the single
+      power-of-10 that brings it closest to 1.0 and pre-scale every value by
+      that factor.  This handles European decimal charts ("3.000" → 3000) where
+      ALL values in the series are inflated by the same factor, making the
+      in-band seed detection in pass 2 useless without this first correction.
+
+    Pass 2 — Local-neighbour fine-tune:
+      Walk low→high T.  Each point is rescaled by the power of 10 that puts it
+      closest to the median of the 2 already-cleaned left neighbours.
+      monotone_dir (+1 rising / -1 falling / 0 unknown): when set, non-monotone
+      candidates are penalised by +1 log-decade so the algorithm prefers the
+      scale factor that preserves the expected trend direction (e.g. for Rds-vs-T,
+      a value lower than its neighbour gets penalised, pushing the choice toward
+      a larger scale factor instead).
+    """
+    idx = sorted(range(len(xs)), key=lambda i: (xs[i] if xs[i] is not None else 0.0))
+
+    # ── Pass 1: global pre-scale ───────────────────────────────────────────────
+    raw_abs = [abs(float(ys[i])) for i in idx if ys[i] is not None and ys[i] != 0]
+    global_p = 0
+    if raw_abs:
+        med_raw = sorted(raw_abs)[len(raw_abs) // 2]
+        if not (0.1 <= med_raw <= 10.0):
+            best_d = float('inf')
+            for p in range(-6, 7):
+                c = med_raw * (10.0 ** p)
+                d = abs(math.log10(max(c, 1e-12)) - 0.0)   # target log10 = 0 (value ≈ 1)
+                if d < best_d:
+                    best_d, global_p = d, p
+
+    prescaled = [float(y) * (10.0 ** global_p) if y is not None else None for y in ys]
+
+    # ── Pass 2: local-neighbour fine-tune ─────────────────────────────────────
+    inband = sorted(abs(float(prescaled[i])) for i in idx
+                    if prescaled[i] is not None and 0.2 <= abs(float(prescaled[i])) <= 6.0)
+    seed = inband[len(inband) // 2] if inband else 1.0
+    cleaned = {}
+    for pos, i in enumerate(idx):
+        y = prescaled[i]
+        if y is None:
+            cleaned[i] = None
+            continue
+        left = [abs(cleaned[idx[k]]) for k in range(max(0, pos - 2), pos)
+                if cleaned.get(idx[k]) is not None]
+        ref = sorted(left)[len(left) // 2] if left else seed
+        prev = sorted(left)[len(left) // 2] if left else None
+
+        a = abs(float(y))
+        best_val, best_d = a, float('inf')
+        # Only penalise monotone direction when the raw value is clearly out of
+        # the valid ratio band [0.02, 20].  If it's already in-range it may
+        # simply come from a different (lower/higher VGS) curve — forcing a scale
+        # correction here would produce a larger wrong value.
+        needs_rescale = not (0.02 <= a <= 20.0)
+        for p2 in range(-5, 6):
+            c = a * (10.0 ** p2)
+            if c < 0.02 or c > 50.0:
+                continue
+            d = abs(math.log10(c) - math.log10(max(ref, 1e-9)))
+            # Penalise direction that violates the expected monotone trend,
+            # but only when we are actually rescaling (not for in-range values).
+            if needs_rescale and monotone_dir != 0 and prev is not None:
+                if monotone_dir > 0 and c < prev * 0.80:
+                    d += 1.5
+                elif monotone_dir < 0 and c > prev * 1.25:
+                    d += 1.5
+            if d < best_d:
+                best_d, best_val = d, c
+        cleaned[i] = math.copysign(best_val, float(y))
+    return [cleaned[i] for i in range(len(ys))]
+
+
+def _clean_ratio_fig(f, monotone_dir=0):
+    """Clean every series of a normalised-ratio figure in place.
+    Saves original y-values as '_raw_y' before modifying, so
+    _extract_ratio_curve can access un-distorted data later.
+    Returns True if any value was corrected."""
+    changed = False
+    for s in f.get('series', []):
+        xs, ys = s.get('x', []), s.get('y', [])
+        if '_raw_y' not in s:
+            s['_raw_y'] = list(ys)   # preserve original for extraction
+        ny = _clean_ratio_series(xs, ys, monotone_dir=monotone_dir)
+        for a, b in zip(ys, ny):
+            if a is not None and b is not None and abs(float(a) - b) > 1e-6:
+                changed = True
+        s['y'] = ny
+    return changed
+
+
+def _extract_ratio_curve(ser, ascending=True):
+    """
+    From a series that may contain multiple overlapping curves (e.g. correct
+    normalised Rds + European-decimal ×1000 duplicate + digitiser artifact),
+    extract the single physically-plausible normalised-ratio sub-curve.
+
+    Uses '_raw_y' (saved by _clean_ratio_fig before cleaning) so the
+    extraction operates on un-distorted original values.
+
+    Strategy:
+      Phase 1 — if enough raw values are already in the physical ratio band
+                 [0.10, 5.0], filter to that band and skip pre-scaling.
+      Phase 2 — if too few raw values are in-band, find the power-of-10 that
+                 brings the series median into band (handles all-×1000 series).
+      Phase 3 — greedy monotone walk: at each x position (possibly multiple y
+                 values from different curves), pick the y that best continues
+                 the ascending / descending trend from the previous point.
+
+    Returns a sorted list of (x, y) pairs with at most one y per x.
+    """
+    xs = ser.get('x', [])
+    ys = ser.get('_raw_y', ser.get('y', []))   # prefer pre-cleaning values
+
+    raw_pairs = sorted(
+        (float(x), float(y)) for x, y in zip(xs, ys)
+        if x is not None and y is not None
+    )
+    if not raw_pairs:
+        return []
+
+    PHYS_LO, PHYS_HI = 0.10, 5.0
+
+    # Phase 1 — count how many raw values are already in the physical band
+    in_range_count = sum(1 for _, y in raw_pairs if PHYS_LO <= abs(y) <= PHYS_HI)
+
+    if in_range_count >= 3:
+        scale = 1.0
+    else:
+        # Phase 2 — global pre-scale (handles all-×1000 European-decimal series)
+        all_abs = sorted(abs(y) for _, y in raw_pairs if y != 0)
+        med = all_abs[len(all_abs) // 2] if all_abs else 1.0
+        best_d, global_p = float('inf'), 0
+        for p in range(-6, 7):
+            c = med * (10.0 ** p)
+            d = abs(math.log10(max(c, 1e-12)))
+            if d < best_d:
+                best_d, global_p = d, p
+        scale = 10.0 ** global_p
+
+    # Build per-x groups, keeping only scaled values inside the physical band
+    from collections import defaultdict
+    x_groups = defaultdict(list)
+    for x, y in raw_pairs:
+        ysc = y * scale
+        if PHYS_LO <= abs(ysc) <= PHYS_HI:
+            x_groups[round(x, 3)].append(ysc)
+
+    if sum(len(v) for v in x_groups.values()) < 3:
+        return raw_pairs   # not enough physical-range points — return raw
+
+    # Phase 3 — greedy monotone walk, trying every first-point candidate as seed.
+    # For the first x-position there may be multiple in-range candidates (e.g. the
+    # correct Rds curve at y=0.518 AND a flat artifact at y=0.928).  The old
+    # "closest-to-1.0" seed picked the artifact.  Instead, run the walk once for
+    # each candidate seed and keep the walk with the widest y-range — the correct
+    # physical curve always spans a wider ratio than any flat artifact.
+    def _run_walk(seed_y):
+        walk, pv = [], None
+        for xk in sorted(x_groups):
+            cands = x_groups[xk]
+            if not cands:
+                continue
+            if pv is None:
+                # Use the prescribed seed; skip this x if seed isn't present
+                if seed_y not in cands:
+                    return []
+                by = seed_y
+            else:
+                if ascending:
+                    ok = [y for y in cands if y >= pv * 0.90]
+                else:
+                    ok = [y for y in cands if y <= pv * 1.10]
+                by = (min(ok, key=lambda y: abs(y - pv)) if ok
+                      else (max if ascending else min)(cands))
+            walk.append((xk, by))
+            pv = by
+        return walk
+
+    first_xk = sorted(x_groups)[0]
+    best_result, best_range = [], -1.0
+    for seed in x_groups[first_xk]:
+        walk = _run_walk(seed)
+        if len(walk) >= 2:
+            ys_w = [y for _, y in walk]
+            y_range = max(ys_w) / max(min(ys_w), 1e-9)
+            if y_range > best_range:
+                best_range, best_result = y_range, walk
+
+    return best_result if len(best_result) >= 2 else raw_pairs
+
+
+def _primary_series(f):
+    """Return the series of a figure with the widest X-span (the main curve),
+    so the comparison table follows the full-range curve rather than a fragment."""
+    if not f or not f.get('series'):
+        return None
+    best, best_span = None, -1.0
+    for s in f['series']:
+        xs = [float(x) for x in s.get('x', []) if x is not None]
+        if len(xs) < 2:
+            continue
+        span = max(xs) - min(xs)
+        if span > best_span:
+            best_span, best = span, s
+    return best or (f['series'][0] if f['series'] else None)
+
+
+def _most_monotone_series(f, ascending=True):
+    """For multi-curve normalised-ratio figures (e.g. 4 VGS curves on one Rds-vs-T
+    graph), select the series with the fewest monotone violations.
+    This picks a clean curve (e.g. VGS=10V) over one whose digitised points jump
+    between curves or have spurious outliers.
+    Tie-broken by: wider X-span, then higher median Y (upper curve → more data)."""
+    if not f or not f.get('series'):
+        return None
+    best, best_key = None, (float('inf'), -1.0, -1.0)
+    for s in f['series']:
+        pairs = sorted((float(x), float(y)) for x, y in zip(s.get('x', []), s.get('y', []))
+                       if x is not None and y is not None)
+        if len(pairs) < 2:
+            continue
+        violations = sum(
+            1 for k in range(1, len(pairs))
+            if (ascending  and pairs[k][1] < pairs[k-1][1] * 0.85) or
+               (not ascending and pairs[k][1] > pairs[k-1][1] * 1.15)
+        )
+        x_span = pairs[-1][0] - pairs[0][0]
+        med_y  = sorted(p[1] for p in pairs)[len(pairs) // 2]
+        key = (violations, -x_span, -med_y)   # fewer violations, wider, higher = better
+        if key < best_key:
+            best_key, best = key, s
+    return best or (f['series'][0] if f['series'] else None)
+
+
 def _group_figures(all_figs_per_file):
     """
     Group digitised figures by chart type across all device files.
@@ -1133,103 +1415,72 @@ def _group_figures(all_figs_per_file):
                              for f in present) and
                          all(any(len(s['y']) >= 2 for s in f['series'])
                              for f in present))
-        # ── European decimal / axis-calibration auto-correction ──────────────────
-        # Some extractor outputs have individual SERIES scaled by the wrong factor
-        # (e.g. "3.000" read as 3000, or one VGS curve calibrated ×100 relative to
-        # others). The correction is per-series: for each series whose max Y value
-        # is > 10× the reference max, find the smallest power of 10 that brings it
-        # to within [ref*0.05, ref*5] and divide.
-        # ref = smallest ymax across present devices (the "most normally scaled" device).
 
-        def _ymax_of(f):
-            ys = [float(y) for s in f.get('series', []) for y in s.get('y', []) if y is not None]
-            return max(ys) if ys else None
+        # ── Normalised-ratio temperature charts (Rds / Vth / VBR vs T_j) ─────────
+        # These use a normalised Y-axis (ratio ≈0.5–3.0).  Two things can go wrong:
+        #   (1) Digitisation errors scale individual points by ×10 / ×100 / ÷100,
+        #       or European decimal "3.000" is read as 3000 (ALL values ×1000).
+        #       → cleaned by _clean_ratio_fig (global pre-scale + local walk).
+        #       IMPORTANT: clean ALL figures FIRST, then check _fig_is_ratio, because
+        #       fully-inflated raw values (median >> 20) would fool _fig_is_ratio into
+        #       thinking the figure is not a ratio chart and skip cleaning entirely.
+        #   (2) One device plots a NORMALISED ratio while the other plots ABSOLUTE
+        #       units (e.g. Infineon V_BR in volts ≈600 vs ST normalised ≈1.0).
+        #       → genuinely incommensurable: flag as units-not-equal (no overlay).
+        if ctype in _NORM_RATIO_CTYPES and present:
+            # Direction hint: Rds rises with T (+1), Vth falls (-1), VBR unknown (0)
+            mono_dir = +1 if ctype == 'rds_vs_temp' else (-1 if ctype == 'vth_vs_temp' else 0)
+            # Clean ALL figures first (even those _fig_is_ratio might not flag yet)
+            for f in per_dev:
+                if f is not None and _clean_ratio_fig(f, monotone_dir=mono_dir):
+                    f['_european_decimal_rescaled'] = True
+            # Re-detect ratio status on the now-cleaned values
+            ratio_ids = {id(f) for f in present if _fig_is_ratio(f)}
 
-        def _fix_inflated_series(f, ref_max):
-            """
-            Correct inflated Y values point-by-point (not per-series).
-            Each data point is tested independently: if its value is > ref_max*10,
-            try powers-of-10 factors and pick the one whose result is closest to
-            ref_max (not just the smallest valid factor).
-            Example: 97.26 with ref_max=2.384 → factor=10 gives 9.726, factor=100
-            gives 0.9726; both fit [0.119, 11.92] but 0.9726 is closer to ref → ÷100.
-            Points already in range are left untouched.
-            Returns True if any point was changed.
-            """
-            changed = False
-            for s in f.get('series', []):
-                new_y = []
-                for y in s.get('y', []):
-                    if y is None:
-                        new_y.append(None)
-                        continue
-                    yf = float(y)
-                    if abs(yf) <= ref_max * 10:
-                        new_y.append(yf)          # already in range — leave alone
-                        continue
-                    # Point is inflated — find all valid factors, pick closest to ref_max
-                    best_factor = None
-                    best_dist   = float('inf')
-                    for factor in (10, 100, 1000, 10000):
-                        c = abs(yf) / factor
-                        if ref_max * 0.05 <= c <= ref_max * 5:
-                            dist = abs(c - ref_max)
-                            if dist < best_dist:
-                                best_dist   = dist
-                                best_factor = factor
-                    if best_factor is not None:
-                        new_y.append(yf / best_factor)
-                        changed = True
-                    else:
-                        new_y.append(yf)          # no good factor — leave as-is
-                s['y'] = new_y
-            return changed
-
-        # rds_vs_temp: always attempt per-series correction (runs regardless of
-        # scale_matched because one device may have y_norm=True from "Normalised"
-        # spelling, making scale_matched start False even when both are normalized).
-        if ctype == 'rds_vs_temp' and len(present) >= 2:
-            pos_ym = sorted(ym for ym in (_ymax_of(f) for f in present)
-                            if ym is not None and ym > 0)
-            if pos_ym:
-                ref = pos_ym[0]   # smallest ymax = most-normally-scaled device
+            if len(ratio_ids) == len(present):
+                # All devices normalised-ratio → comparable → overlay + table.
+                scale_matched = True
+            elif ratio_ids:
+                # Mixed: some normalised, some absolute → not comparable.
+                scale_matched = False
                 for f in per_dev:
-                    if f is not None and _fix_inflated_series(f, ref):
-                        f['_european_decimal_rescaled'] = True
-                # After correction: if all devices are now in the normalized range
-                # (≤ 10), treat as matched regardless of y_norm flags.
-                ymax_post = [m for m in (_ymax_of(f) for f in present) if m is not None]
-                if ymax_post and all(ym <= 10.0 for ym in ymax_post):
-                    scale_matched = True
+                    if f is not None:
+                        f['_y_likely_normalised'] = (id(f) in ratio_ids)
 
-        # Generic: for all non-temperature, non-log matched chart types,
-        # apply the same per-series correction when devices differ by > 100×.
-        _EUR_SKIP = {'rds_vs_temp', 'vth_vs_temp', 'vbr_vs_temp'} | _FIGURE_LOG_TYPES
+        # ── Generic cross-device rescue for non-temperature, non-log charts ──────
+        # If both devices share real units but one is ~1000× the other (European
+        # decimal "3.000"→3000), divide the inflated device's series into range.
+        _EUR_SKIP = _NORM_RATIO_CTYPES | _FIGURE_LOG_TYPES
         if scale_matched and len(present) >= 2 and ctype not in _EUR_SKIP:
+            def _ymax_of(f):
+                ys = [abs(float(y)) for s in f.get('series', [])
+                      for y in s.get('y', []) if y is not None]
+                return max(ys) if ys else None
             pos_g = sorted(ym for ym in (_ymax_of(f) for f in present)
                            if ym is not None and ym > 0)
             if len(pos_g) >= 2 and pos_g[-1] / pos_g[0] > 100:
                 ref_g = pos_g[0]
                 for f in per_dev:
-                    if f is not None and _fix_inflated_series(f, ref_g):
+                    if f is None:
+                        continue
+                    chg = False
+                    for s in f.get('series', []):
+                        ny = []
+                        for y in s.get('y', []):
+                            if y is None:
+                                ny.append(None); continue
+                            yf = float(y)
+                            if abs(yf) <= ref_g * 10:
+                                ny.append(yf); continue
+                            for factor in (10, 100, 1000, 10000):
+                                if ref_g * 0.05 <= abs(yf) / factor <= ref_g * 5:
+                                    ny.append(yf / factor); chg = True; break
+                            else:
+                                ny.append(yf)
+                        s['y'] = ny
+                    if chg:
                         f['_european_decimal_rescaled'] = True
 
-        # Empirical check: only for chart types where datasheets genuinely use
-        # normalised Y-axes (vth_vs_temp, vbr_vs_temp).  For all other types
-        # (Eoss, power, gate-charge, etc.) a small Y value is a legitimate
-        # absolute measurement, NOT a normalised axis — do not flag it.
-        _NORM_Y_CTYPES = {'vth_vs_temp', 'vbr_vs_temp'}
-        if scale_matched and len(present) >= 2 and ctype in _NORM_Y_CTYPES:
-            y_maxes = [m for m in (_ymax_of(f) for f in present) if m is not None]
-            if len(y_maxes) >= 2:
-                norm_count = sum(1 for ym in y_maxes if ym <= 5.0)
-                abs_count  = sum(1 for ym in y_maxes if ym > 10.0)
-                if norm_count > 0 and abs_count > 0:
-                    scale_matched = False
-                    for f in per_dev:
-                        if f is not None:
-                            ym = _ymax_of(f)
-                            f['_y_likely_normalised'] = (ym is not None and ym <= 5.0)
         groups.append({
             'chart_type':      ctype,
             'display_name':    disp,
@@ -1390,15 +1641,38 @@ def _figure_table_points(group, labels, n_points=5):
     is_log  = ctype in _FIGURE_LOG_TYPES
     xl, _   = _FIGURE_AXIS_LABELS.get(ctype, _CHART_AXIS_LABELS.get(ctype, ('X', 'Y')))
 
+    is_ratio = ctype in _NORM_RATIO_CTYPES
     prim = []
     all_x = []
     for f in figs:
         if f is None or not f['series']:
             prim.append(None); continue
-        ser   = f['series'][0]
-        pairs = sorted((float(x), float(y)) for x, y in zip(ser['x'], ser['y'])
-                       if x is not None and y is not None
-                       and (not is_log or (float(x) > 0 and float(y) > 0)))
+        if is_ratio:
+            # Pick the series with the widest in-band y-range.  The correct Rds
+            # curve (e.g. 0.518→2.384, ratio≈4.6) always spans a much wider range
+            # than flat artifacts or spurious digitiser curves (0.928→1.107,
+            # ratio≈1.19).  This is robust regardless of series ordering in the
+            # file and does not require merging series (which can cause the walk
+            # to switch curves at intermediate x-positions).
+            ascending = (ctype != 'vth_vs_temp')
+            PHYS_LO, PHYS_HI = 0.10, 5.0
+            best_ser, best_ratio = None, -1.0
+            for s in f['series']:
+                raw = s.get('_raw_y', s.get('y', []))
+                inb = [abs(float(y)) for y in raw
+                       if y is not None and PHYS_LO <= abs(float(y)) <= PHYS_HI]
+                if len(inb) < 2:
+                    continue
+                yr = max(inb) / max(min(inb), 1e-9)
+                if yr > best_ratio:
+                    best_ratio, best_ser = yr, s
+            ser = best_ser or _primary_series(f) or f['series'][0]
+            pairs = _extract_ratio_curve(ser, ascending=ascending)
+        else:
+            ser = _primary_series(f) or f['series'][0]
+            pairs = sorted((float(x), float(y)) for x, y in zip(ser['x'], ser['y'])
+                           if x is not None and y is not None
+                           and (not is_log or (float(x) > 0 and float(y) > 0)))
         prim.append(pairs if len(pairs) >= 2 else None)
         all_x += [p[0] for p in pairs]
     if not all_x:
@@ -2783,6 +3057,19 @@ def build_report(paths, mosfets, norm_list, ref, iavg_def, irms_def,
             wc(ws, row, 2, unit,
                font=fnt(10), fill=ff(bg), align=ctr(), border=BT)
 
+            # ── Log-graph parameters (Ciss/Coss/Crss): no reliable number —
+            #    point the reader to the datasheet images in the Graph sheet ──
+            if key in _REFER_TO_GRAPH_KEYS:
+                # Merge the device value columns + Best + Method + Calc into one
+                # cell carrying the "refer the graphs" line.
+                ws.merge_cells(start_row=row, start_column=fdc,
+                               end_row=row, end_column=fdc + n + 2)
+                wc(ws, row, fdc, "→  " + _REFER_TO_GRAPH_TEXT,
+                   font=fnt(10, italic=True, bold=True, color="7F0000"),
+                   fill=ff("FFF3CD"), align=ctr(), border=BT)
+                row += 1
+                continue
+
             vals   = norm_vals(key)
             vals_d = {i: v for i, v in enumerate(vals) if v is not None}
             best_i = _winner(vals_d, lower_better)
@@ -3647,7 +3934,196 @@ def build_report(paths, mosfets, norm_list, ref, iavg_def, irms_def,
             os.remove(tp)
         except OSError:
             pass
-    print(f"\n✅  Report saved → {out_path}")
+    print("\nReport saved -> %s" % out_path)
+
+
+def generate_reasons_pdf(mosfets, norm_list, ref, labels, out_path):
+    """
+    Concise 1–2 page PDF explaining WHICH parameters are extrapolated to the
+    common reference point and WHY the remaining ones are not.
+    Directly answers the three reason-categories the user asked about:
+      (i)   no usable graph / curve in the datasheet,
+      (ii)  only a single value at one condition → no second point to interpolate,
+      (iii) value lives on a LOG-scale graph → auto-extraction unreliable,
+      (+)   circuit-condition-dependent (switching times depend on R_G / drive).
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors as RL
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+        from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                         Table, TableStyle, HRFlowable)
+    except ImportError:
+        print("\n⚠  reportlab not installed — reasons PDF skipped (pip install reportlab).")
+        return None
+
+    PW, PH = A4
+    LM = RM = 1.6 * cm
+    BW = PW - LM - RM
+    vds_ref, id_ref, tj_ref = ref["vds_ref"], ref["id_ref"], ref["tj_ref"]
+
+    NAVY  = RL.HexColor("#1B3A6B"); DKBLUE = RL.HexColor("#17375E")
+    GREEN = RL.HexColor("#1D6B2C"); LGREEN = RL.HexColor("#E2EFDA")
+    AMBER = RL.HexColor("#7F3000"); LAMBER = RL.HexColor("#FFF3CD")
+    RED   = RL.HexColor("#8B0000"); LGREY  = RL.HexColor("#F2F2F2")
+    MGREY = RL.HexColor("#CCCCCC"); WHITE  = RL.white
+    DGREY = RL.HexColor("#444444")
+
+    def sty(**kw):
+        d = dict(fontName="Helvetica", fontSize=9, leading=12, spaceAfter=3)
+        d.update(kw); return ParagraphStyle("_", **d)
+    S_BODY = sty(alignment=TA_JUSTIFY)
+    def P(t, s=None): return Paragraph(t, s or S_BODY)
+    def SP(n=6):      return Spacer(1, n)
+
+    CELL  = sty(fontSize=8, leading=10)
+    CELLB = sty(fontSize=8, leading=10, fontName="Helvetica-Bold")
+    CELLH = sty(fontSize=8, leading=10, fontName="Helvetica-Bold", textColor=WHITE)
+    def c(t, s=CELL):  return Paragraph(str(t), s)
+
+    story = []
+
+    # ── Title ────────────────────────────────────────────────────────────────
+    story += [
+        Table([[c("WHY SOME PARAMETERS ARE EXTRAPOLATED AND OTHERS ARE NOT",
+                  sty(fontSize=15, fontName="Helvetica-Bold", textColor=WHITE,
+                      leading=19, alignment=TA_CENTER))]],
+              colWidths=[BW],
+              style=TableStyle([("BACKGROUND", (0,0),(-1,-1), NAVY),
+                                ("TOPPADDING", (0,0),(-1,-1), 9),
+                                ("BOTTOMPADDING", (0,0),(-1,-1), 9)])),
+        SP(5),
+        P(f"<b>Devices:</b> {'   vs   '.join(labels)}", sty(fontSize=9, alignment=TA_CENTER, spaceAfter=1)),
+        P(f"<b>Common reference point:</b> V<sub>DS</sub> = {vds_ref:.0f} V    "
+          f"I<sub>D</sub> = {id_ref:.0f} A    T<sub>j</sub> = {tj_ref:.0f} °C",
+          sty(fontSize=9, alignment=TA_CENTER, textColor=DGREY, spaceAfter=2)),
+        HRFlowable(width="100%", thickness=1, color=NAVY, spaceAfter=5),
+        P("<b>Goal of extrapolation.</b> Datasheets report each parameter at the "
+          "manufacturer's own test condition, and these conditions differ between "
+          "devices. To compare two MOSFETs fairly we bring every parameter to ONE "
+          "common reference point (above). A parameter can only be moved to that "
+          "point when the datasheet gives enough information to do so reliably — "
+          "either a digitised curve, two data points to interpolate between, or a "
+          "sound physics formula. When none of these exist, the value is shown as "
+          "the direct datasheet number and is NOT forced to the reference point.",
+          sty(fontName="Helvetica", fontSize=8.7, leading=11.5, alignment=TA_JUSTIFY)),
+        SP(5),
+    ]
+
+    # ── Reason legend ────────────────────────────────────────────────────────
+    def legend_row(tag, color, text):
+        return [c(tag, sty(fontSize=8, fontName="Helvetica-Bold", textColor=color)),
+                c(text, CELL)]
+    leg = Table(
+        [[c("Why a parameter CANNOT be extrapolated", CELLH)],
+         ],
+        colWidths=[BW],
+        style=TableStyle([("BACKGROUND",(0,0),(-1,-1), DKBLUE),
+                          ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4)]))
+    reasons = Table([
+        legend_row("(i)  No curve",
+                   RED, "The datasheet has no graph for this quantity vs the reference "
+                        "variable (temperature or voltage), so there is nothing to read or fit."),
+        legend_row("(ii) Single point",
+                   AMBER, "Only one value at one condition is printed. A straight line needs "
+                          "two points — with one point a temperature/voltage slope cannot be formed."),
+        legend_row("(iii) Log-scale graph",
+                   AMBER, "The value lives on a log–log C-vs-V_DS graph. Automatic pixel "
+                          "extraction from log axes is unreliable, so no number is invented — "
+                          "the reader is pointed to the datasheet image instead."),
+        legend_row("(+) Circuit-dependent",
+                   DGREY, "Switching delays/rise/fall times depend on the external gate "
+                          "resistor and driver, not on a device-intrinsic curve, so they "
+                          "cannot be re-referenced; the datasheet value is shown as-is."),
+    ], colWidths=[BW*0.20, BW*0.80],
+       style=TableStyle([("GRID",(0,0),(-1,-1),0.3,MGREY),
+                         ("ROWBACKGROUNDS",(0,0),(-1,-1),[LGREY,WHITE]),
+                         ("VALIGN",(0,0),(-1,-1),"TOP"),
+                         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+                         ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6)]))
+    story += [leg, reasons, SP(7)]
+
+    # ── Per-parameter status table ───────────────────────────────────────────
+    # (parameter, extrapolated?, method/handling, reason)
+    EXTRAP = [
+        ("R_DS(on) @ T_j",   "YES", "Table/curve interpolation between 25 °C and high-T points",
+         "Two temperature points (or a normalised R-vs-T curve) are available."),
+        ("V_GS(th) @ T_j",   "YES", "Graph-interpolated from V_th-vs-T curve, else -5 mV/°C formula",
+         "Curve or a well-established silicon temperature coefficient exists."),
+        ("V_(BR)DSS @ T_j",  "YES", "Read from V_BR-vs-T_j curve (+temp. coefficient)",
+         "Breakdown-vs-temperature curve is published."),
+        ("E_on / E_off @ ref","YES", "Overlap-model formula, scaled on both V_DD and I_D",
+         "Computable from switching times and linear in V_DD and I_D."),
+        ("E_oss @ V_DS",     "YES", "Formula  E_oss = 1/2 C_oss(V_DS) V_DS^2",
+         "Energy follows a known capacitance-voltage physics law."),
+        ("Q_G @ V_DS",       "YES", "Gate-charge value scaled by Q_gd*(V_DS,ref/V_DS,test)",
+         "Charge splits into a V_DS-dependent (Q_gd) and -independent part."),
+        ("V_SD @ T_j",       "YES", "Body-diode formula  -2 mV/°C",
+         "Standard silicon diode temperature coefficient applies."),
+        ("t_rr / Q_rr @ T_j","YES (approx.)", "First-order temperature scaling (+0.5 / +1 %/°C)",
+         "Only a coarse coefficient is known; flagged approximate."),
+    ]
+    NOEXT = [
+        ("C_iss / C_oss / C_rss", "NO", "Shown as 'refer the graphs in graph section'",
+         "(iii) Log-scale C-vs-V_DS graph — extraction unreliable."),
+        ("Q_GD", "NO", "Direct datasheet value",
+         "(ii) Single tabulated value; no second point to interpolate."),
+        ("t_d(on), t_r, t_d(off), t_f", "NO", "Direct datasheet value",
+         "(+) Circuit-condition-dependent (gate resistor / driver)."),
+        ("I_D (continuous)", "NO", "Direct rated value @ 25 °C",
+         "Rating/definition, not a quantity referenced to an operating point."),
+    ]
+
+    def status_table(title, rows, header_bg, yes=True):
+        data = [[c(title, CELLH), c("", CELLH), c("", CELLH), c("", CELLH)],
+                [c("Parameter", CELLH), c("To ref?", CELLH),
+                 c("How it is handled", CELLH), c("Reason", CELLH)]]
+        for p, st, meth, rsn in rows:
+            data.append([c(p, CELLB),
+                         c(st, sty(fontSize=8, fontName="Helvetica-Bold",
+                                   textColor=GREEN if yes else RED)),
+                         c(meth), c(rsn)])
+        ts = TableStyle([
+            ("SPAN", (0,0),(-1,0)),
+            ("BACKGROUND", (0,0),(-1,0), header_bg),
+            ("BACKGROUND", (0,1),(-1,1), DKBLUE),
+            ("ROWBACKGROUNDS", (0,2),(-1,-1), [WHITE, LGREY]),
+            ("GRID", (0,1),(-1,-1), 0.3, MGREY),
+            ("VALIGN", (0,0),(-1,-1), "TOP"),
+            ("TOPPADDING", (0,0),(-1,-1), 4), ("BOTTOMPADDING", (0,0),(-1,-1), 4),
+            ("LEFTPADDING", (0,0),(-1,-1), 6), ("RIGHTPADDING", (0,0),(-1,-1), 6),
+        ])
+        return Table(data, colWidths=[BW*0.22, BW*0.11, BW*0.34, BW*0.33],
+                     style=ts, repeatRows=2)
+
+    story += [status_table("PARAMETERS BROUGHT TO THE COMMON REFERENCE POINT",
+                           EXTRAP, GREEN, yes=True), SP(6)]
+    story += [status_table("PARAMETERS SHOWN AS DIRECT DATASHEET VALUES (NOT EXTRAPOLATED)",
+                           NOEXT, AMBER, yes=False), SP(6)]
+    story += [
+        P("<b>In short:</b> a parameter is extrapolated when the datasheet gives a "
+          "digitised curve, two interpolation points, or a sound physics formula — "
+          "otherwise it is shown as its direct datasheet value.",
+          sty(fontSize=8.5, leading=11, textColor=DGREY, alignment=TA_JUSTIFY)),
+    ]
+
+    def draw(canvas, doc):
+        canvas.saveState()
+        w, h = A4
+        canvas.setFillColor(NAVY); canvas.rect(0, 0, w, 1.0*cm, fill=1, stroke=0)
+        canvas.setFont("Helvetica", 7); canvas.setFillColor(WHITE)
+        canvas.drawString(LM, 0.35*cm, "MOSFET Extrapolation — Reasons Note")
+        canvas.drawRightString(w - RM, 0.35*cm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    SimpleDocTemplate(out_path, pagesize=A4, leftMargin=LM, rightMargin=RM,
+                      topMargin=1.2*cm, bottomMargin=1.2*cm,
+                      title="MOSFET Extrapolation Reasons").build(
+        story, onFirstPage=draw, onLaterPages=draw)
+    print(f"✅  Reasons note PDF: {out_path}")
+    return out_path
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -4232,7 +4708,7 @@ def generate_extrapolation_pdf(mosfets, norm_list, ref, labels, out_path):
         leftMargin=LM, rightMargin=RM,
         topMargin=1.8*cm, bottomMargin=2.0*cm,
         title="MOSFET Extrapolation Method Notes",
-        author="mosfet_comparison5.py",
+        author="mosfet_comparison6.py",
     )
     doc.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
     print(f"\n✅  Extrapolation notes PDF: {out_path}")
@@ -4347,11 +4823,15 @@ def main():
                  all_charts_per_file=all_charts_per_file,
                  all_figs_per_file=all_figs_per_file)
 
-    # ── 8. Generate extrapolation notes PDF ──────────────────────────────────
+    # ── 8. Generate PDFs ──────────────────────────────────────────────────────
     print("\n── Generating extrapolation notes PDF ──")
     labels = [mosfet_label(p, d) for p, d in zip(valid, mosfets)]
     pdf_path = out.replace(".xlsx", "_Extrapolation_Notes.pdf")
     generate_extrapolation_pdf(mosfets, norm_list, ref, labels, pdf_path)
+
+    # Concise 1–2 page note: why some parameters are extrapolated and others not
+    reasons_path = out.replace(".xlsx", "_Why_Extrapolated.pdf")
+    generate_reasons_pdf(mosfets, norm_list, ref, labels, reasons_path)
 
     print("\n📌  Quick guide (7 sheets):")
     print("  Sheet 1 'Raw Parameter Comparison'    — all values as extracted from datasheet + conditions")
@@ -4360,7 +4840,10 @@ def main():
     print("  Sheet 4 'Loss Calculation'            — live formula results + full formula reference")
     print("  Sheet 5 'Scoring Dashboard'           — 0-100 score per param + scoring methodology")
     print("  Sheet 6 'Raw Extracted Data'          — full typ/max/high-T table + test conditions")
-    print("  Sheet 7 'Graph Comparison'            — side-by-side charts + overlay + 5-point comparison table\n")
+    print("  Sheet 7 'Graph Comparison'            — side-by-side charts + overlay + 5-point comparison table")
+    print("\n📄  PDFs generated:")
+    print("  *_Why_Extrapolated.pdf      — 1-page note: which params are extrapolated and WHY (and why not)")
+    print("  *_Extrapolation_Notes.pdf   — detailed per-parameter method + step-by-step calculations\n")
 
 
 if __name__ == "__main__":
