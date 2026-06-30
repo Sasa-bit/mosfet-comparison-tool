@@ -1,0 +1,9 @@
+# Output reports (generated files, not source)
+*.xlsx
+*.pdf
+~$*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
